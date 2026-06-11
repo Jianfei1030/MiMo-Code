@@ -268,6 +268,34 @@ bun run build:dev -- --skip-install
 - `package.json` 依赖发生变化后
 - 从上游拉取更新后依赖有变动
 
+## Git 推送与 husky pre-push hook
+
+项目配置了 husky pre-push hook，会在 `git push` 前自动运行 `bun turbo typecheck` 对全仓库做类型检查。
+
+### bun shim 路径问题
+
+Windows 上 `npm` 全局安装的 bun shim（`%APPDATA%\npm\bun`）可能指向一个不存在的路径 `node_modules/bun/bin/bun.exe`，导致 hook 报错 `command not found`。
+
+修复方法：编辑 `%APPDATA%\npm\bun`（shell 脚本）和 `%APPDATA%\npm\bun.ps1`，把 bun 路径改为实际安装位置：
+
+```
+# bun (shell)
+exec "$HOME/.bun/bin/bun.exe" "$@"
+
+# bun.ps1
+& "$HOME/.bun/bin/bun.exe" $args
+```
+
+### typecheck 失败
+
+上游 `packages/app/src/custom-elements.d.ts` 是一个 symlink，在 Windows 上 checkout 后变成纯文本文件，`tsgo` 无法解析导致 `@mimo-ai/desktop` 类型检查失败。这是上游已有问题，不是我们的改动。
+
+遇到这种情况用 `--no-verify` 跳过 hook：
+
+```powershell
+git push --no-verify origin main
+```
+
 ## 推荐命令速查
 
 完整构建并接入全局命令的核心命令如下：
