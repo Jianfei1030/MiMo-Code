@@ -41,3 +41,6 @@ tsconfig.tsbuildinfo
 experiment/*.log
 experiment/last-outcome.json
 /experiment
+
+# Local lockfile drift (workspace version overrides upstream)
+bun.lock
