@@ -37,6 +37,9 @@ function supportsImageInput(model: Provider.Model): boolean {
 export const OUTPUT_TOKEN_MAX = Flag.MIMOCODE_EXPERIMENTAL_OUTPUT_TOKEN_MAX || 32_000
 const MIMO_OUTPUT_TOKEN_MAX = 128_000
 
+// OpenAI Responses include needed for stateless multi-turn reasoning with store=false.
+const INCLUDE_ENCRYPTED_REASONING = ["reasoning.encrypted_content"] as const
+
 // Maps npm package to the key the AI SDK expects for providerOptions
 function sdkKey(npm: string): string | undefined {
   switch (npm) {
@@ -328,6 +331,24 @@ function applyCaching(msgs: ModelMessage[], model: Provider.Model): ModelMessage
   return msgs
 }
 
+function mapProviderOptions(
+  msgs: ModelMessage[],
+  transform: (options: Record<string, any> | undefined) => Record<string, any> | undefined,
+) {
+  return msgs.map((msg) => {
+    if (!Array.isArray(msg.content)) return { ...msg, providerOptions: transform(msg.providerOptions) }
+    return {
+      ...msg,
+      providerOptions: transform(msg.providerOptions),
+      content: msg.content.map((part) =>
+        part.type === "tool-approval-request" || part.type === "tool-approval-response"
+          ? part
+          : { ...part, providerOptions: transform(part.providerOptions) },
+      ),
+    } as typeof msg
+  })
+}
+
 function unsupportedParts(msgs: ModelMessage[], model: Provider.Model): ModelMessage[] {
   return msgs.map((msg) => {
     if (msg.role !== "user" || !Array.isArray(msg.content)) return msg
@@ -432,18 +453,18 @@ export function message(msgs: ModelMessage[], model: Provider.Model, options: Re
       return result
     }
 
-    msgs = msgs.map((msg) => {
-      if (!Array.isArray(msg.content)) return { ...msg, providerOptions: remap(msg.providerOptions) }
-      return {
-        ...msg,
-        providerOptions: remap(msg.providerOptions),
-        content: msg.content.map((part) => {
-          if (part.type === "tool-approval-request" || part.type === "tool-approval-response") {
-            return { ...part }
-          }
-          return { ...part, providerOptions: remap(part.providerOptions) }
-        }),
-      } as typeof msg
+    msgs = mapProviderOptions(msgs, remap)
+  }
+
+  // Strip Responses item IDs before SDK serialization, matching upstream OpenCode.
+  // Doing this in the fetch wrapper mutates already-serialized input and breaks
+  // Paper Hub's Azure-backed GPT-5.5 tool-call follow-up requests.
+  if (options.store !== true && key && ["@ai-sdk/openai", "@ai-sdk/azure"].includes(model.api.npm)) {
+    msgs = mapProviderOptions(msgs, (options) => {
+      if (!options?.[key] || !("itemId" in options[key])) return options
+      const metadata = { ...options[key] }
+      delete metadata.itemId
+      return { ...options, [key]: metadata }
     })
   }
 
@@ -980,11 +1001,12 @@ export function options(input: {
   }
 
   if (input.model.api.id.includes("gpt-5") && !input.model.api.id.includes("gpt-5-chat")) {
-    if (!input.model.api.id.includes("gpt-5-pro")) {
+    if (input.model.providerID === "paperhub" && input.model.api.npm === "@ai-sdk/openai-compatible") {
+      // Paper Hub custom provider uses Chat Completions; GPT-5.5 reasoningEffort
+      // with function tools is only supported through the built-in openai provider
+      // (Responses API). Keep paperhub/gpt-5.5 as a no-reasoning fallback.
+    } else if (!input.model.api.id.includes("gpt-5-pro")) {
       result["reasoningEffort"] = "medium"
-      // Only inject reasoningSummary for providers that support it natively.
-      // @ai-sdk/openai-compatible proxies (e.g. LiteLLM) do not understand this
-      // parameter and return "Unknown parameter: 'reasoningSummary'".
       if (
         input.model.api.npm === "@ai-sdk/openai" ||
         input.model.api.npm === "@ai-sdk/azure" ||
@@ -992,10 +1014,13 @@ export function options(input: {
       ) {
         result["reasoningSummary"] = "auto"
       }
+      if (input.model.api.npm === "@ai-sdk/openai") {
+        result["include"] = INCLUDE_ENCRYPTED_REASONING
+      }
     }
 
-    // Only set textVerbosity for non-chat gpt-5.x models
-    // Chat models (e.g. gpt-5.2-chat-latest) only support "medium" verbosity
+    // Only set textVerbosity for non-chat gpt-5.x models.
+    // Chat models (e.g. gpt-5.2-chat-latest) only support "medium" verbosity.
     if (
       input.model.api.id.includes("gpt-5.") &&
       !input.model.api.id.includes("codex") &&
@@ -1007,7 +1032,7 @@ export function options(input: {
 
     if (input.model.providerID.startsWith("opencode")) {
       result["promptCacheKey"] = input.sessionID
-      result["include"] = ["reasoning.encrypted_content"]
+      result["include"] = INCLUDE_ENCRYPTED_REASONING
       result["reasoningSummary"] = "auto"
     }
   }
@@ -1212,6 +1237,18 @@ function flattenDiscriminatedUnion(schema: JSONSchema.BaseSchema | JSONSchema7):
   } as JSONSchema7
 }
 
+function flattenDiscriminatedUnions(schema: JSONSchema.BaseSchema | JSONSchema7): JSONSchema7 {
+  const visit = (node: unknown): unknown => {
+    if (node === null || typeof node !== "object") return node
+    if (Array.isArray(node)) return node.map(visit)
+
+    const flattened = flattenDiscriminatedUnion(node as JSONSchema.BaseSchema | JSONSchema7) as Record<string, unknown>
+    return Object.fromEntries(Object.entries(flattened).map(([key, value]) => [key, visit(value)]))
+  }
+
+  return visit(schema) as JSONSchema7
+}
+
 export function schema(model: Provider.Model, schema: JSONSchema.BaseSchema | JSONSchema7): JSONSchema7 {
   /*
   if (["openai", "azure"].includes(providerID)) {
@@ -1231,13 +1268,13 @@ export function schema(model: Provider.Model, schema: JSONSchema.BaseSchema | JS
   }
   */
 
-  // Many providers reject root-level `anyOf`/`oneOf` in tool schemas:
+  // Many providers reject `anyOf`/`oneOf` in tool schemas:
   // - OpenAI/Azure: "schema must have type 'object' and not have 'oneOf'/'anyOf'"
   // - Bedrock: "input_schema.type: Field required"
   // - Anthropic proxies to Bedrock: same Bedrock error
   // Flatten unconditionally — all providers accept a flat `type: "object"` schema,
   // and zod's runtime parse still enforces per-variant required fields strictly.
-  schema = flattenDiscriminatedUnion(schema)
+  schema = flattenDiscriminatedUnions(schema)
 
   // Convert integer enums to string enums for Google/Gemini
   if (model.providerID === "google" || model.api.id.includes("gemini")) {
