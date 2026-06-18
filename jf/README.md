@@ -339,3 +339,36 @@ npm link
 mimo --version
 mimo
 ```
+
+## 端到端测试（必选）
+
+**每次合并上游 + 构建完成后，必须执行此测试。测试不通过则不允许提交。**
+
+### 测试命令
+
+```powershell
+Set-Location D:\Projects\MiMo-Code
+& "packages\opencode\dist\mimocode-windows-x64\bin\mimo.exe" run --model opencode-go/mimo-v2.5 "Say hello in one sentence"
+```
+
+### 预期结果
+
+- 返回 LLM 响应（如 `Hello! Welcome to MiMoCode...`）
+- 无报错、无崩溃
+
+### 测试原理
+
+验证以下链路完整可用：
+1. 构建产物能正常启动
+2. `opencode-go` provider 能被识别（mimo.ts 未禁用）
+3. `mimo-v2.5` 模型能获得认证（mimo-free.ts 生效）
+4. LLM 请求→响应链路通畅
+
+### 失败排查
+
+| 现象 | 原因 | 修复 |
+|------|------|------|
+| `model not found` | provider 被禁用 | 检查 mimo.ts 是否有 `disabled_providers` 代码 |
+| `401 Unauthorized` | JWT 认证失败 | 检查 mimo-free.ts bootstrap 逻辑 |
+| `connection refused` | 网络问题 | 检查防火墙/代理 |
+| 无响应/超时 | 模型服务异常 | 等待重试或换模型 |
