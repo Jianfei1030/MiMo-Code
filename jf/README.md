@@ -287,6 +287,8 @@ Remove-Item .husky/pre-push -Force
 |------|----------|
 | `packages/opencode/src/plugin/mimo-free.ts` | 免费模型认证插件，提供 `opencode` 和 `opencode-go` provider。上游删除了此文件，逻辑移入 `mimo.ts`，但 `mimo.ts` 同时禁用了这两个 provider |
 | `packages/opencode/src/plugin/mimo.ts` | 上游新增了禁用 `opencode`/`opencode-go` provider 的逻辑（`disabled_providers`）。**必须移除第 92-100 行的禁用代码**，否则免费模型消失 |
+| `packages/opencode/src/plugin/index.ts` | **必须保留 `MimoFreeAuthPlugin` 的导入和注册**。上游会删除此插件的导入（`import { MimoFreeAuthPlugin } from "./mimo-free"`）并从 `INTERNAL_PLUGINS` 数组中移除。如果缺失，免费 `opencode/mimo-v2.5` 模型将不可用。检查方法：`Select-String -Path packages/opencode/src/plugin/index.ts -Pattern "MimoFreeAuthPlugin"` |
+| `packages/opencode/src/provider/provider.ts` | **必须保留免费模型过滤逻辑的修改**。上游在 `opencode` provider 的 custom loader 中会删除所有免费模型（`cost.input === 0`）。我们修改为只删除未认证用户的付费模型，保留免费模型。检查方法：`Get-Content packages/opencode/src/provider/provider.ts | Select-String -Pattern "cost.input"` |
 | `packages/opencode/src/cli/cmd/tui/context/local.tsx` | 我们保留了"用户手动选择模型优先"逻辑（`hasUserSet`），上游会改成"agent 指定强制覆盖"，行为不同 |
 | `packages/opencode/package.json` | 三处修改：① `MIMOCODE_CHANNEL=latest`（上游用 `MIMOCODE_CHANNEL=prod`，注意变量名已从 `OPENCODE_CHANNEL` 改为 `MIMOCODE_CHANNEL`）；② `version: "0.1.1"`（与上游 tag v0.1.1 保持一致）；③ 添加 `#read-sqlite` import（上游新增的条件导入） |
 | `packages/opencode/src/provider/transform.ts` | GPT-5.5 + Paper Hub 兼容修复：内置 `openai/gpt-5.5` 走 Responses API；递归 flatten 工具 schema 里的嵌套 `anyOf`/`oneOf`（`task.operation` 会导致 Azure server_error）；OpenAI Responses 的 `itemId` 在 SDK 序列化前移除；保留 encrypted reasoning include 和 `textVerbosity`；`paperhub/gpt-5.5` 仅作为 Chat Completions fallback，跳过 reasoningEffort。**合并上游时除非上游已覆盖这些修复，否则必须保留** |
@@ -296,22 +298,28 @@ Remove-Item .husky/pre-push -Force
 合并后恢复这些文件的命令：
 
 ```powershell
-git checkout HEAD~1 -- packages/opencode/src/plugin/mimo-free.ts packages/opencode/src/plugin/mimo.ts packages/opencode/src/cli/cmd/tui/context/local.tsx packages/opencode/package.json packages/opencode/src/provider/transform.ts jf/README.md
+git checkout HEAD~1 -- packages/opencode/src/plugin/mimo-free.ts packages/opencode/src/plugin/mimo.ts packages/opencode/src/plugin/index.ts packages/opencode/src/provider/provider.ts packages/opencode/src/cli/cmd/tui/context/local.tsx packages/opencode/package.json packages/opencode/src/provider/transform.ts jf/README.md
 ```
 
 如果 `jf/` 目录也被删除了，需要先重建目录：
 
 ```powershell
 mkdir jf -Force
-git checkout HEAD~1 -- packages/opencode/src/plugin/mimo-free.ts packages/opencode/src/plugin/mimo.ts packages/opencode/src/cli/cmd/tui/context/local.tsx packages/opencode/package.json packages/opencode/src/provider/transform.ts
+git checkout HEAD~1 -- packages/opencode/src/plugin/mimo-free.ts packages/opencode/src/plugin/mimo.ts packages/opencode/src/plugin/index.ts packages/opencode/src/provider/provider.ts packages/opencode/src/cli/cmd/tui/context/local.tsx packages/opencode/package.json packages/opencode/src/provider/transform.ts
 git show HEAD~1:jf/README.md > jf/README.md
 ```
 
-合并后还需要手动检查 `mimo.ts` 是否恢复了禁用逻辑。如果第 92-100 行有 `disabled_providers` 相关代码，必须删除：
+合并后还需要手动检查：
 
 ```powershell
 # 检查 mimo.ts 是否有禁用逻辑
 Get-Content packages/opencode/src/plugin/mimo.ts | Select-String -Pattern "disabled_providers"
+
+# 检查 index.ts 是否保留了 MimoFreeAuthPlugin
+Select-String -Path packages/opencode/src/plugin/index.ts -Pattern "MimoFreeAuthPlugin"
+
+# 检查 provider.ts 是否保留了免费模型过滤逻辑
+Get-Content packages/opencode/src/provider/provider.ts | Select-String -Pattern "cost.input"
 ```
 
 ## 推荐命令速查
@@ -348,27 +356,36 @@ mimo
 
 ```powershell
 Set-Location D:\Projects\MiMo-Code
+
+# 测试 1: opencode-go provider（免费模型）
 & "packages\opencode\dist\mimocode-windows-x64\bin\mimo.exe" run --model opencode-go/mimo-v2.5 "Say hello in one sentence"
+
+# 测试 2: opencode provider（免费模型）
+& "packages\opencode\dist\mimocode-windows-x64\bin\mimo.exe" run --model opencode/mimo-v2.5-free "Say hello in one sentence"
 ```
 
 ### 预期结果
 
-- 返回 LLM 响应（如 `Hello! Welcome to MiMoCode...`）
+- 两个测试都返回 LLM 响应（如 `Hello! Welcome to MiMoCode...`）
 - 无报错、无崩溃
 
 ### 测试原理
 
 验证以下链路完整可用：
 1. 构建产物能正常启动
-2. `opencode-go` provider 能被识别（mimo.ts 未禁用）
-3. `mimo-v2.5` 模型能获得认证（mimo-free.ts 生效）
-4. LLM 请求→响应链路通畅
+2. `opencode-go` 和 `opencode` provider 能被识别（mimo.ts 未禁用）
+3. `MimoFreeAuthPlugin` 已注册（index.ts 包含导入）
+4. 免费模型未被过滤（provider.ts 保留 cost.input === 0 的模型）
+5. `mimo-v2.5` 模型能获得认证（mimo-free.ts 生效）
+6. LLM 请求→响应链路通畅
 
 ### 失败排查
 
 | 现象 | 原因 | 修复 |
 |------|------|------|
 | `model not found` | provider 被禁用 | 检查 mimo.ts 是否有 `disabled_providers` 代码 |
+| 免费模型不显示 | MimoFreeAuthPlugin 未注册 | 检查 index.ts 是否有 `MimoFreeAuthPlugin` 导入和注册 |
+| 免费模型被过滤 | provider.ts 过滤逻辑 | 检查 provider.ts 的 `cost.input` 过滤逻辑，确保保留免费模型 |
 | `401 Unauthorized` | JWT 认证失败 | 检查 mimo-free.ts bootstrap 逻辑 |
 | `connection refused` | 网络问题 | 检查防火墙/代理 |
 | 无响应/超时 | 模型服务异常 | 等待重试或换模型 |
