@@ -242,6 +242,19 @@ Add-Content .git\info\exclude "jf/"
 
 如果希望这些策略、脚本和记录跟随 fork 走，就不要加到 `.git/info/exclude`，正常提交 `jf/` 即可。
 
+## 处理 "unrelated histories" 错误
+
+如果执行 `git pull` 或 `git merge` 时报告 "refusing to merge unrelated histories"（通常发生在仓库重建、force push 或根提交 hash 不同时），使用以下命令：
+
+```powershell
+git fetch upstream
+git merge upstream/main --allow-unrelated-histories --no-commit
+```
+
+`--allow-unrelated-histories` 允许合并没有共同祖先的分支，`--no-commit` 会在自动合并后暂停，方便你检查冲突和定制文件是否被覆盖，确认无误后再手动 `git commit`。
+
+**注意**：合并后应先检查 jf/README.md 中列出的关键文件是否被上游覆盖，再决定是否需要恢复定制。不是每次合并都会触动所有 listed 文件，应先实际 `git diff` 确认。
+
 ## 注意事项
 
 - `jf/` 可以减少自定义文件和上游文件的冲突，但不能避免源码修改本身产生冲突。
@@ -292,21 +305,36 @@ Remove-Item .husky/pre-push -Force
 | `packages/opencode/src/cli/cmd/tui/context/local.tsx` | 我们保留了"用户手动选择模型优先"逻辑（`hasUserSet`），上游会改成"agent 指定强制覆盖"，行为不同 |
 | `packages/opencode/package.json` | 三处修改：① `MIMOCODE_CHANNEL=latest`（上游用 `MIMOCODE_CHANNEL=prod`，注意变量名已从 `OPENCODE_CHANNEL` 改为 `MIMOCODE_CHANNEL`）；② `version: "0.1.1"`（与上游 tag v0.1.1 保持一致）；③ 添加 `#read-sqlite` import（上游新增的条件导入） |
 | `packages/opencode/src/provider/transform.ts` | GPT-5.5 + Paper Hub 兼容修复：内置 `openai/gpt-5.5` 走 Responses API；递归 flatten 工具 schema 里的嵌套 `anyOf`/`oneOf`（`task.operation` 会导致 Azure server_error）；OpenAI Responses 的 `itemId` 在 SDK 序列化前移除；保留 encrypted reasoning include 和 `textVerbosity`；`paperhub/gpt-5.5` 仅作为 Chat Completions fallback，跳过 reasoningEffort。**合并上游时除非上游已覆盖这些修复，否则必须保留** |
+| `packages/opencode/src/skill/index.ts` | **技能加载竞态修复**：`loadSkills`（约 220 行）去掉 `concurrency: "unbounded"` 改为串行，使 `discoverSkills` 的扫描顺序（compose → 外部 `.claude`/`.agents` → config dirs → `skills.paths`）决定同名技能覆盖优先级——`skills.paths`（用户配置目录）最后扫描、最后 `add`、稳定胜出。`add` 的 duplicate 警告降级为 `log.debug`（约 100 行）。上游若恢复并发加载，同名技能（如 `deep-search`）在 `~/.claude/skills`（C盘）与 `skills.paths`（G盘）间会不确定覆盖，`skills.paths` 不再稳定胜出。检查方法：`Get-Content packages/opencode/src/skill/index.ts \| Select-String -Pattern "concurrency"` 应**无输出**（`Effect.forEach` 默认串行，不传 concurrency） |
+| `packages/opencode/test/session/skill-override-e2e.test.ts` | **新增的端到端测试文件**，上游不存在。锁定上述修复：用 `SystemPrompt.skills(agent)` 驱动真实技能加载→系统提示词组装管线，断言 `<available_skills>` 中 `deep-search` 的 `<location>` 指向 `skills.paths` 路径而非 `.claude/skills`。上游合并若删除此文件需从本地恢复 |
+| `packages/opencode/test/skill/skill.test.ts` | 含新增单元测试 `skills.paths overrides same-named skill in ~/.claude/skills`（基线无此用例）。上游合并若覆盖该文件需从本地恢复该用例。检查方法：`Select-String -Path packages/opencode/test/skill/skill.test.ts -Pattern "skills.paths overrides"` 应有输出 |
 | `.husky/pre-push` | **必须保持删除状态**。上游 symlink 问题导致 typecheck 在 Windows 上必定失败，等待上游修复后再恢复 |
 | `jf/README.md` | 本文件是我们的目录，上游可能删除整个目录 |
 
 合并后恢复这些文件的命令：
 
 ```powershell
-git checkout HEAD~1 -- packages/opencode/src/plugin/mimo-free.ts packages/opencode/src/plugin/mimo.ts packages/opencode/src/plugin/index.ts packages/opencode/src/provider/provider.ts packages/opencode/src/cli/cmd/tui/context/local.tsx packages/opencode/package.json packages/opencode/src/provider/transform.ts jf/README.md
+git checkout HEAD~1 -- packages/opencode/src/plugin/mimo-free.ts packages/opencode/src/plugin/mimo.ts packages/opencode/src/plugin/index.ts packages/opencode/src/provider/provider.ts packages/opencode/src/cli/cmd/tui/context/local.tsx packages/opencode/package.json packages/opencode/src/provider/transform.ts packages/opencode/src/skill/index.ts jf/README.md
 ```
 
 如果 `jf/` 目录也被删除了，需要先重建目录：
 
 ```powershell
 mkdir jf -Force
-git checkout HEAD~1 -- packages/opencode/src/plugin/mimo-free.ts packages/opencode/src/plugin/mimo.ts packages/opencode/src/plugin/index.ts packages/opencode/src/provider/provider.ts packages/opencode/src/cli/cmd/tui/context/local.tsx packages/opencode/package.json packages/opencode/src/provider/transform.ts
+git checkout HEAD~1 -- packages/opencode/src/plugin/mimo-free.ts packages/opencode/src/plugin/mimo.ts packages/opencode/src/plugin/index.ts packages/opencode/src/provider/provider.ts packages/opencode/src/cli/cmd/tui/context/local.tsx packages/opencode/package.json packages/opencode/src/provider/transform.ts packages/opencode/src/skill/index.ts
 git show HEAD~1:jf/README.md > jf/README.md
+```
+
+`skill-override-e2e.test.ts` 是新增文件（上游无此文件），若被合并删除需单独恢复：
+
+```powershell
+git checkout HEAD~1 -- packages/opencode/test/session/skill-override-e2e.test.ts
+```
+
+`skill.test.ts` 含新增的单元测试（基线代码无 `skills.paths overrides` 测试用例），若上游覆盖了该文件需从本地恢复该用例（或合并后重新追加）：
+
+```powershell
+git checkout HEAD~1 -- packages/opencode/test/skill/skill.test.ts
 ```
 
 合并后还需要手动检查：
@@ -320,6 +348,11 @@ Select-String -Path packages/opencode/src/plugin/index.ts -Pattern "MimoFreeAuth
 
 # 检查 provider.ts 是否保留了免费模型过滤逻辑
 Get-Content packages/opencode/src/provider/provider.ts | Select-String -Pattern "cost.input"
+
+# 检查 skill/index.ts 是否保持串行加载（应无 concurrency 输出）
+# 上游若恢复 concurrency: "unbounded" 会让同名技能覆盖不确定，
+# 导致 ~/.claude/skills 下的旧版 deep-search 偶发覆盖 skills.paths 的新版
+Get-Content packages/opencode/src/skill/index.ts | Select-String -Pattern "concurrency"
 ```
 
 ## 推荐命令速查
@@ -362,6 +395,10 @@ Set-Location D:\Projects\MiMo-Code
 
 # 测试 2: opencode provider（免费模型）
 & "packages\opencode\dist\mimocode-windows-x64\bin\mimo.exe" run --model opencode/mimo-v2.5-free "Say hello in one sentence"
+
+# 测试 3: 技能加载竞态修复（skill override 优先级）
+Set-Location D:\Projects\MiMo-Code\packages\opencode
+bun test test/session/skill-override-e2e.test.ts
 ```
 
 ### 预期结果
@@ -378,6 +415,7 @@ Set-Location D:\Projects\MiMo-Code
 4. 免费模型未被过滤（provider.ts 保留 cost.input === 0 的模型）
 5. `mimo-v2.5` 模型能获得认证（mimo-free.ts 生效）
 6. LLM 请求→响应链路通畅
+7. 技能加载串行化生效（skill/index.ts 无 `concurrency: "unbounded"`），`skills.paths` 配置目录的同名技能稳定覆盖 `~/.claude/skills` 下的旧版——`<available_skills>` 中 `<location>` 指向用户配置目录
 
 ### 失败排查
 
@@ -389,3 +427,4 @@ Set-Location D:\Projects\MiMo-Code
 | `401 Unauthorized` | JWT 认证失败 | 检查 mimo-free.ts bootstrap 逻辑 |
 | `connection refused` | 网络问题 | 检查防火墙/代理 |
 | 无响应/超时 | 模型服务异常 | 等待重试或换模型 |
+| e2e 测试失败：`<location>` 指向 `.claude/skills` | skill/index.ts 恢复了并发加载 | 检查 `Select-String -Pattern "concurrency"` 有输出，移除 `concurrency: "unbounded"` 恢复串行 |

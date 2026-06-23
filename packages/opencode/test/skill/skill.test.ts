@@ -462,4 +462,78 @@ description: A skill in the .mimocode/skills directory.
       { git: true },
     ),
   )
+
+  // Regression: loadSkills MUST run serially so that discoverSkills' scan order
+  // determines which same-named skill wins. skills.paths (user-configured) is
+  // scanned LAST, so it must override a same-named skill under ~/.claude/skills.
+  // Previously loadSkills used concurrency: "unbounded", which decoupled the
+  // winner from scan order via non-deterministic async file-read completion,
+  // causing ~/.claude/skills/<name> to sometimes beat skills.paths/<name>.
+  it.live("skills.paths overrides same-named skill in ~/.claude/skills (scan order == priority)", () =>
+    Effect.gen(function* () {
+      const tmp = yield* Effect.acquireRelease(
+        Effect.promise(() => tmpdir({ git: true })),
+        (tmp) => Effect.promise(() => tmp[Symbol.asyncDispose]()),
+      )
+
+      yield* withHome(
+        tmp.path,
+        Effect.gen(function* () {
+          // Stale version under ~/.claude/skills (scanned EARLY, lower priority).
+          const claudeSkillDir = path.join(tmp.path, ".claude", "skills", "dup-skill")
+          yield* Effect.promise(() => fs.mkdir(claudeSkillDir, { recursive: true }))
+          yield* Effect.promise(() =>
+            Bun.write(
+              path.join(claudeSkillDir, "SKILL.md"),
+              `---
+name: dup-skill
+description: stale claude version
+---
+
+# stale
+`,
+            ),
+          )
+
+          // Fresh version under a user-configured skills.paths dir (scanned LAST).
+          const userSkillRoot = path.join(tmp.path, "user-skills")
+          const userSkillDir = path.join(userSkillRoot, "dup-skill")
+          yield* Effect.promise(() => fs.mkdir(userSkillDir, { recursive: true }))
+          yield* Effect.promise(() =>
+            Bun.write(
+              path.join(userSkillDir, "SKILL.md"),
+              `---
+name: dup-skill
+description: fresh user version
+---
+
+# fresh
+`,
+            ),
+          )
+
+          // Write config so skills.paths resolves to userSkillRoot.
+          yield* Effect.promise(() =>
+            Bun.write(
+              path.join(tmp.path, "mimocode.json"),
+              JSON.stringify({
+                $schema: "https://opencode.ai/config.json",
+                skills: { paths: [userSkillRoot] },
+              }),
+            ),
+          )
+
+          yield* Effect.gen(function* () {
+            const skill = yield* Skill.Service
+            const got = yield* skill.get("dup-skill")
+            expect(got).toBeDefined()
+            // The user-configured skills.paths entry must win.
+            expect(got!.location).toContain(path.join("user-skills", "dup-skill", "SKILL.md"))
+            expect(got!.location).not.toContain(path.join(".claude", "skills", "dup-skill"))
+            expect(got!.description).toBe("fresh user version")
+          }).pipe(provideInstance(tmp.path))
+        }),
+      )
+    }),
+  )
 })

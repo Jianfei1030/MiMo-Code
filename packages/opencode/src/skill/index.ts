@@ -98,10 +98,10 @@ const add = Effect.fnUntraced(function* (state: State, match: string, bus: Bus.I
   if (!parsed.success) return
 
   if (state.skills[parsed.data.name]) {
-    log.warn("duplicate skill name", {
+    log.debug("skill overridden by later source", {
       name: parsed.data.name,
-      existing: state.skills[parsed.data.name].location,
-      duplicate: match,
+      previous: state.skills[parsed.data.name].location,
+      current: match,
     })
   }
 
@@ -218,8 +218,19 @@ const discoverSkills = Effect.fnUntraced(function* (
 })
 
 const loadSkills = Effect.fnUntraced(function* (state: State, discovered: DiscoveryState, bus: Bus.Interface) {
+  // NOTE: loadSkills MUST run serially (default concurrency, not "unbounded").
+  // `add` unconditionally overwrites `state.skills[name]` (line ~109), so the
+  // LAST scanned match wins. discoverSkills scans in priority order:
+  // compose → external (.claude/.agents/...) → config dirs → skills.paths.
+  // skills.paths (user-configured) is scanned LAST, so it must also be the
+  // last `add` call to win. With concurrency: "unbounded" the async file reads
+  // in `add` (ConfigMarkdown.parse → Filesystem.readText) complete in
+  // OS-scheduled order, decoupling the winner from the scan order and causing
+  // non-deterministic skill resolution (e.g. ~/.claude/skills/deep-search
+  // sometimes beats the user's skills.paths/deep-search). Serial iteration
+  // makes scan order == override order, restoring the documented intent
+  // ("user skills with same name override", index.ts:157).
   yield* Effect.forEach(discovered.matches, (match) => add(state, match, bus), {
-    concurrency: "unbounded",
     discard: true,
   })
 
