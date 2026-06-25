@@ -83,7 +83,9 @@ OPENCODE_CHANNEL=latest bun run script/build.ts --single
 
 `--single` 表示只构建当前操作系统和 CPU 架构的二进制，避免全平台构建，速度更快。
 
-> **⚠️ 版本号注意**：`MIMOCODE_CHANNEL` 必须是 `latest`，否则 `@mimo-ai/script` 会将构建视为 preview channel，版本号回退为 `0.0.0-<channel>-<timestamp>` 格式（如 `0.0.0-prod-202606111710`），而不是从 `package.json` 读取真实版本号（如 `0.1.1`）。合并上游更新时务必检查此值是否被还原。**注意：变量名已从 `OPENCODE_CHANNEL` 改为 `MIMOCODE_CHANNEL`**。
+> **⚠️ 版本号注意**：`MIMOCODE_CHANNEL` 必须是 `latest`，否则 `@mimo-ai/script` 会将构建视为 preview channel，版本号回退为 `0.0.0-<channel>-<timestamp>` 格式（如 `0.0.0-prod-202606111710`），而不是从 `package.json` 读取真实版本号（当前 `0.1.3`）。合并上游更新时务必检查此值是否被还原。**注意：变量名已从 `OPENCODE_CHANNEL` 改为 `MIMOCODE_CHANNEL`**。
+
+> **⚠️ Bun 版本要求**：上游 v0.1.2+ 要求 `bun@^1.3.14`。如果构建报版本错误，执行 `powershell -c "irm bun.sh/install.ps1|iex"` 升级。
 
 Windows x64 的主要产物通常在：
 
@@ -255,6 +257,16 @@ git merge upstream/main --allow-unrelated-histories --no-commit
 
 **注意**：合并后应先检查 jf/README.md 中列出的关键文件是否被上游覆盖，再决定是否需要恢复定制。不是每次合并都会触动所有 listed 文件，应先实际 `git diff` 确认。
 
+## SSRF 白名单（内网 Provider）
+
+上游 v0.1.2 新增了 SSRF 保护（`src/util/ssrf.ts`），会阻止解析到内网 IP（`10.x`、`172.16-31.x`、`192.168.x` 等）的请求。如果 Provider API 地址解析到内网 IP（如 Paper Hub `tc-paperhub.diezhi.net` → `10.10.224.42`），需要设置环境变量：
+
+```powershell
+[Environment]::SetEnvironmentVariable("MIMOCODE_SSRF_ALLOWED_HOSTS", "tc-paperhub.diezhi.net", "User")
+```
+
+多个 hostname 用逗号分隔。我们在 `ssrf.ts` 中添加了 `MIMOCODE_SSRF_ALLOWED_HOSTS` 支持，合并上游时此修改可能被覆盖，需重新添加。
+
 ## 注意事项
 
 - `jf/` 可以减少自定义文件和上游文件的冲突，但不能避免源码修改本身产生冲突。
@@ -303,11 +315,12 @@ Remove-Item .husky/pre-push -Force
 | `packages/opencode/src/plugin/index.ts` | **必须保留 `MimoFreeAuthPlugin` 的导入和注册**。上游会删除此插件的导入（`import { MimoFreeAuthPlugin } from "./mimo-free"`）并从 `INTERNAL_PLUGINS` 数组中移除。如果缺失，免费 `opencode/mimo-v2.5` 模型将不可用。检查方法：`Select-String -Path packages/opencode/src/plugin/index.ts -Pattern "MimoFreeAuthPlugin"` |
 | `packages/opencode/src/provider/provider.ts` | **必须保留免费模型过滤逻辑的修改**。上游在 `opencode` provider 的 custom loader 中会删除所有免费模型（`cost.input === 0`）。我们修改为只删除未认证用户的付费模型，保留免费模型。检查方法：`Get-Content packages/opencode/src/provider/provider.ts | Select-String -Pattern "cost.input"` |
 | `packages/opencode/src/cli/cmd/tui/context/local.tsx` | 我们保留了"用户手动选择模型优先"逻辑（`hasUserSet`），上游会改成"agent 指定强制覆盖"，行为不同 |
-| `packages/opencode/package.json` | 三处修改：① `MIMOCODE_CHANNEL=latest`（上游用 `MIMOCODE_CHANNEL=prod`，注意变量名已从 `OPENCODE_CHANNEL` 改为 `MIMOCODE_CHANNEL`）；② `version: "0.1.1"`（与上游 tag v0.1.1 保持一致）；③ 添加 `#read-sqlite` import（上游新增的条件导入） |
+| `packages/opencode/package.json` | 两处修改：① `MIMOCODE_CHANNEL=latest`（上游用 `MIMOCODE_CHANNEL=prod`）；② `version` 跟随上游（当前 `0.1.3`） |
 | `packages/opencode/src/provider/transform.ts` | GPT-5.5 + Paper Hub 兼容修复：内置 `openai/gpt-5.5` 走 Responses API；递归 flatten 工具 schema 里的嵌套 `anyOf`/`oneOf`（`task.operation` 会导致 Azure server_error）；OpenAI Responses 的 `itemId` 在 SDK 序列化前移除；保留 encrypted reasoning include 和 `textVerbosity`；`paperhub/gpt-5.5` 仅作为 Chat Completions fallback，跳过 reasoningEffort。**合并上游时除非上游已覆盖这些修复，否则必须保留** |
 | `packages/opencode/src/skill/index.ts` | **技能加载竞态修复**：`loadSkills`（约 220 行）去掉 `concurrency: "unbounded"` 改为串行，使 `discoverSkills` 的扫描顺序（compose → 外部 `.claude`/`.agents` → config dirs → `skills.paths`）决定同名技能覆盖优先级——`skills.paths`（用户配置目录）最后扫描、最后 `add`、稳定胜出。`add` 的 duplicate 警告降级为 `log.debug`（约 100 行）。上游若恢复并发加载，同名技能（如 `deep-search`）在 `~/.claude/skills`（C盘）与 `skills.paths`（G盘）间会不确定覆盖，`skills.paths` 不再稳定胜出。检查方法：`Get-Content packages/opencode/src/skill/index.ts \| Select-String -Pattern "concurrency"` 应**无输出**（`Effect.forEach` 默认串行，不传 concurrency） |
 | `packages/opencode/test/session/skill-override-e2e.test.ts` | **新增的端到端测试文件**，上游不存在。锁定上述修复：用 `SystemPrompt.skills(agent)` 驱动真实技能加载→系统提示词组装管线，断言 `<available_skills>` 中 `deep-search` 的 `<location>` 指向 `skills.paths` 路径而非 `.claude/skills`。上游合并若删除此文件需从本地恢复 |
 | `packages/opencode/test/skill/skill.test.ts` | 含新增单元测试 `skills.paths overrides same-named skill in ~/.claude/skills`（基线无此用例）。上游合并若覆盖该文件需从本地恢复该用例。检查方法：`Select-String -Path packages/opencode/test/skill/skill.test.ts -Pattern "skills.paths overrides"` 应有输出 |
+| `packages/opencode/src/util/ssrf.ts` | **SSRF 白名单支持**：添加了 `MIMOCODE_SSRF_ALLOWED_HOSTS` 环境变量解析和 hostname 跳过逻辑。上游若覆盖此文件需重新添加。检查方法：`Select-String -Path packages/opencode/src/util/ssrf.ts -Pattern "ALLOWED_HOSTS"` |
 | `.husky/pre-push` | **必须保持删除状态**。上游 symlink 问题导致 typecheck 在 Windows 上必定失败，等待上游修复后再恢复 |
 | `jf/README.md` | 本文件是我们的目录，上游可能删除整个目录 |
 
@@ -360,16 +373,16 @@ Get-Content packages/opencode/src/skill/index.ts | Select-String -Pattern "concu
 完整构建并接入全局命令的核心命令如下：
 
 ```powershell
-Set-Location D:\Projects\MiMo-Code
+Set-Location G:\projects\MiMo-Code
 bun install
 
-Set-Location D:\Projects\MiMo-Code\packages\opencode
+Set-Location G:\projects\MiMo-Code\packages\opencode
 bun run build:dev
 npm link
 
 [Environment]::SetEnvironmentVariable(
   "MIMOCODE_BIN_PATH",
-  "D:\Projects\MiMo-Code\packages\opencode\dist\mimocode-windows-x64\bin\mimo.exe",
+  "G:\projects\MiMo-Code\packages\opencode\dist\mimocode-windows-x64\bin\mimo.exe",
   "User"
 )
 ```
@@ -388,7 +401,7 @@ mimo
 ### 测试命令
 
 ```powershell
-Set-Location D:\Projects\MiMo-Code
+Set-Location G:\projects\MiMo-Code
 
 # 测试 1: opencode-go provider（免费模型）
 & "packages\opencode\dist\mimocode-windows-x64\bin\mimo.exe" run --model opencode-go/mimo-v2.5 "Say hello in one sentence"
@@ -397,7 +410,7 @@ Set-Location D:\Projects\MiMo-Code
 & "packages\opencode\dist\mimocode-windows-x64\bin\mimo.exe" run --model opencode/mimo-v2.5-free "Say hello in one sentence"
 
 # 测试 3: 技能加载竞态修复（skill override 优先级）
-Set-Location D:\Projects\MiMo-Code\packages\opencode
+Set-Location G:\projects\MiMo-Code\packages\opencode
 bun test test/session/skill-override-e2e.test.ts
 ```
 
