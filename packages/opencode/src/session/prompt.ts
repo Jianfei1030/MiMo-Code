@@ -54,7 +54,7 @@ import * as CrossSpawnSpawner from "@/effect/cross-spawn-spawner"
 import * as Stream from "effect/Stream"
 import { Command } from "../command"
 import { pathToFileURL, fileURLToPath } from "url"
-import { ConfigMarkdown } from "../config"
+import { ConfigMarkdown, ConfigCompose } from "../config"
 import { SessionSummary } from "./summary"
 import { NamedError } from "@mimo-ai/shared/util/error"
 import { SessionProcessor } from "./processor"
@@ -484,12 +484,24 @@ export const layer = Layer.effect(
       )
       if (composeModeMsg) {
         const composeModeBlock = composeSkillsBlock()
+        const ctx = yield* InstanceState.context
+        const composeCfg = (yield* config.get()).compose
+        const docsDir = ConfigCompose.resolveDocsDir(ctx.worktree, composeCfg)
+        const composeDocsBlock = [
+          "<compose_docs_dir>",
+          `Save compose skill outputs: specs in \`${path.join(docsDir, "specs")}\`, plans in \`${path.join(docsDir, "plans")}\`, reports in \`${path.join(docsDir, "reports")}\`.`,
+          "</compose_docs_dir>",
+        ].join("\n")
         composeModeMsg.parts.unshift({
           id: PartID.ascending(),
           messageID: composeModeMsg.info.id,
           sessionID: composeModeMsg.info.sessionID,
           type: "text",
-          text: PROMPT_COMPOSE + (composeModeBlock ? "\n\n" + composeModeBlock : ""),
+          text:
+            PROMPT_COMPOSE +
+            (composeModeBlock ? "\n\n" + composeModeBlock : "") +
+            "\n\n" +
+            composeDocsBlock,
           synthetic: true,
         })
       }
@@ -750,8 +762,8 @@ NOTE: At any point in time through this workflow you should feel free to ask the
                 )
                 if (
                   (item.id === "write" || item.id === "edit") &&
-                  beforeOutput.args?.filePath &&
-                  isExtensionPath(beforeOutput.args.filePath)
+                  beforeOutput.args?.file_path &&
+                  isExtensionPath(beforeOutput.args.file_path)
                 ) {
                   yield* registry.reload().pipe(Effect.tapError((err) => Effect.sync(() => log.warn("extension reload failed", { error: err }))), Effect.ignore)
                 }
@@ -1445,7 +1457,7 @@ NOTE: At any point in time through this workflow you should feel free to ask the
                     sessionID: input.sessionID,
                     type: "text",
                     synthetic: true,
-                    text: `Called the Read tool with the following input: ${JSON.stringify({ filePath: part.filename })}`,
+                    text: `Called the Read tool with the following input: ${JSON.stringify({ file_path: part.filename })}`,
                   },
                   {
                     messageID: info.id,
@@ -1504,7 +1516,7 @@ NOTE: At any point in time through this workflow you should feel free to ask the
                   offset = Math.max(start, 1)
                   if (end) limit = end - (offset - 1)
                 }
-                const args = { filePath: filepath, offset, limit }
+                const args = { file_path: filepath, offset, limit }
                 const pieces: Draft<MessageV2.Part>[] = [
                   {
                     messageID: info.id,
@@ -1560,7 +1572,7 @@ NOTE: At any point in time through this workflow you should feel free to ask the
               }
 
               if (part.mime === "application/x-directory") {
-                const args = { filePath: filepath }
+                const args = { file_path: filepath }
                 const exit = yield* execRead(args).pipe(Effect.exit)
                 if (Exit.isFailure(exit)) {
                   const error = Cause.squash(exit.cause)
@@ -1605,7 +1617,7 @@ NOTE: At any point in time through this workflow you should feel free to ask the
                   sessionID: input.sessionID,
                   type: "text",
                   synthetic: true,
-                  text: `Called the Read tool with the following input: {"filePath":"${filepath}"}`,
+                  text: `Called the Read tool with the following input: {"file_path":"${filepath}"}`,
                 },
                 {
                   id: part.id,
@@ -2892,10 +2904,10 @@ NOTE: At any point in time through this workflow you should feel free to ask the
                   parentSessionID: session.parentID,
                   system: additions,
                   prebuiltSystem,
-                  messages: [...modelMsgs, ...(isLastStep ? [{ role: "assistant" as const, content: MAX_STEPS }] : [])],
+                  messages: [...modelMsgs, ...(isLastStep ? [{ role: "user" as const, content: MAX_STEPS }] : [])],
                   tools,
                   model,
-                  toolChoice: format.type === "json_schema" ? "required" : undefined,
+                  toolChoice: isLastStep ? "none" : format.type === "json_schema" ? "required" : undefined,
                   agentID: lastUser.agentID,
                 })
                 .pipe(
@@ -3051,10 +3063,10 @@ NOTE: At any point in time through this workflow you should feel free to ask the
               // MessageV2.User.system for logging/replay); llm.stream itself uses prebuiltSystem.
               system: additions,
               prebuiltSystem,
-              messages: [...modelMsgs, ...(isLastStep ? [{ role: "assistant" as const, content: MAX_STEPS }] : [])],
+              messages: [...modelMsgs, ...(isLastStep ? [{ role: "user" as const, content: MAX_STEPS }] : [])],
               tools,
               model,
-              toolChoice: format.type === "json_schema" ? ("required" as const) : undefined,
+              toolChoice: isLastStep ? ("none" as const) : format.type === "json_schema" ? ("required" as const) : undefined,
               agentID: lastUser.agentID,
             }
 
