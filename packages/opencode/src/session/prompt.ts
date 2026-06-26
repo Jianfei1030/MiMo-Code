@@ -184,6 +184,7 @@ const PREDICT_NUDGE = `Based on the conversation above, write the user's most li
 
 const OUTPUT_LENGTH_CONTINUATION_LIMIT = Flag.MIMOCODE_OUTPUT_LENGTH_CONTINUATION_LIMIT
 const INVALID_OUTPUT_CONTINUATION_LIMIT = Flag.MIMOCODE_INVALID_OUTPUT_CONTINUATION_LIMIT
+const TEXT_TOOL_CALL_RETRY_LIMIT = Flag.MIMOCODE_TEXT_TOOL_CALL_RETRY_LIMIT
 
 const log = Log.create({ service: "session.prompt" })
 
@@ -533,7 +534,20 @@ export const layer = Layer.effect(
         sessionID: userMessage.info.sessionID,
         type: "text",
         text: `<system-reminder>
-Plan mode is active. The user indicated that they do not want you to execute yet -- you MUST NOT make any edits (with the exception of the plan file mentioned below), run any non-readonly tools (including changing configs or making commits), or otherwise make any changes to the system. This supersedes any other instructions you have received.
+Plan mode is active. The user wants you to research and design, NOT to execute yet. This supersedes any other instructions you have received.
+
+## What you SHOULD do (recommended)
+- Prefer the dedicated read-only tools for everything they cover — \`read\` (view files), \`grep\` (search contents), \`glob\` (find files), and the \`lsp\` tools (definitions, references, diagnostics). These are the right way to explore the code.
+- Spawn \`explore\`/\`general\` subagents for parallel research.
+- Only when those tools genuinely can't get what you need, you MAY use \`bash\` for the gap — but ONLY for commands you are certain are a pure read with NO side effects (e.g. \`git status\`/\`log\`/\`diff\`, listing dependencies). Do NOT reach for \`bash\` to do what \`read\`/\`grep\`/\`glob\` already do.
+
+## What you MUST NOT do
+- Do NOT edit or create any file other than the plan file below. Writes to non-plan files are blocked outright and will fail — do not attempt them and do not ask the user to approve them.
+- Do NOT run \`test\`, \`lint\`, \`typecheck\`, \`build\`, or similar project commands. These are NOT safe by default: \`lint\` is often configured with \`--fix\`, \`test\` may write snapshots or touch a database, \`build\` writes artifacts, and scripts behind them can do anything. The ONLY exception is if you have explicitly verified — by reading the exact command/config — that this specific invocation has no side effects (no \`--fix\`/\`--write\`, no file/state/db mutation). If you cannot verify that, treat it as forbidden and note it in the plan instead.
+- Do NOT run any other side-effecting \`bash\`: no commits, no \`git push\`, no installing/removing packages, no writing/moving/deleting files, no changing configs, no \`change_directory\`, no \`workflow\`.
+- If you find yourself wanting to mutate something to make progress, that's a signal to write it into the plan instead and continue researching read-only.
+
+Use good judgment: take the read-only action yourself rather than pushing avoidable confirmation prompts onto the user. Only the plan file is writable.
 
 ## Plan File Info:
 ${exists ? `A plan file already exists at ${plan}. You can read it and make incremental edits using the edit tool.` : `No plan file exists yet. You should create your plan at ${plan} using the write tool.`}
@@ -674,7 +688,7 @@ NOTE: At any point in time through this workflow you should feel free to ask the
                 ...req,
                 sessionID: input.session.id,
                 tool: { messageID: input.processor.message.id, callID: options.toolCallId },
-                ruleset: Permission.merge(input.agent.permission, input.session.permission ?? []),
+                ruleset: Agent.runtimePermission(input.agent, input.session.permission),
                 // System-spawned background agents (checkpoint-writer, dream, distill)
                 // have no human to answer a permission prompt — fail clean, don't hang.
                 interactive: !SYSTEM_SPAWNED_AGENT_TYPES.has(input.agent.name),
@@ -1015,7 +1029,7 @@ NOTE: At any point in time through this workflow you should feel free to ask the
               .ask({
                 ...req,
                 sessionID,
-                ruleset: Permission.merge(taskAgent.permission, session.permission ?? []),
+                ruleset: Agent.runtimePermission(taskAgent, session.permission),
               })
               .pipe(Effect.orDie),
         })
@@ -1803,6 +1817,10 @@ NOTE: At any point in time through this workflow you should feel free to ask the
         // 与 invalidContinuations（generic invalid）分离，互不污染。局部于 runLoop，
         // 新一轮用户 turn 自动归零。
         let structuredRetries = 0
+        // Bounded retries for text-form tool calls (model wrote a tool call as
+        // prose text instead of a structured tool_use). Local to runLoop so each
+        // fresh user turn starts clean.
+        let textToolCallRetries = 0
         const resolvedAgentID = agentID ?? "main"
         // Tracks plugin-driven cancellation (session.pre OR any session.userQuery.pre)
         // so session.post reports outcome="cancelled" instead of "error".
@@ -2191,6 +2209,69 @@ NOTE: At any point in time through this workflow you should feel free to ask the
           return true
         })
 
+        // Text-form tool call recovery. The model serialized a tool call as prose
+        // text instead of a structured tool_use (a degraded state under large
+        // context). The bad assistant turn is DISCARDED from history by setting
+        // assistant.error (toModelMessages skips a message whose info.error is
+        // set, message-v2.ts), so it can neither strand the conversation on an
+        // assistant turn (provider prefill rejection) nor poison later context.
+        // We then retry the request (caller does `continue`, no new message). On
+        // exhaustion the error stays terminal. Returns true ⇒ continue; false ⇒ break.
+        const autoRetryTextToolCall = Effect.fn("SessionPrompt.autoRetryTextToolCall")(function* (input: {
+          lastUser: MessageV2.User
+          assistant: MessageV2.Assistant
+        }) {
+          // Already discarded on a prior pass — let classify fall through to
+          // `failed` instead of re-detecting and burning another retry.
+          if (input.assistant.error) return false
+          // Discard the bad turn from request history: toModelMessages skips a
+          // message whose info.error is set, so it can neither strand the
+          // conversation on an assistant turn nor poison later context.
+          input.assistant.error = new MessageV2.TextToolCallError({
+            message: "Model emitted a tool call as text instead of a structured tool call.",
+          }).toObject()
+          yield* sessions.updateMessage(input.assistant)
+          if (textToolCallRetries >= TEXT_TOOL_CALL_RETRY_LIMIT) {
+            yield* bus.publish(Session.Event.Error, {
+              sessionID: input.assistant.sessionID,
+              error: input.assistant.error,
+            })
+            return false
+          }
+          textToolCallRetries++
+          yield* slog.info("retrying text-form tool call", { attempt: textToolCallRetries })
+          // Append a synthetic user turn so the discarded assistant becomes stale
+          // (classify staleness guard) AND the loop reaches generation — mirrors
+          // autoRetryStructuredOutput. Without this the loop re-enters, re-detects
+          // the same turn, and burns retries with zero model calls.
+          const msg = yield* sessions.updateMessage({
+            id: MessageID.ascending(),
+            role: "user" as const,
+            sessionID: input.lastUser.sessionID,
+            agentID: input.lastUser.agentID,
+            agent: input.lastUser.agent,
+            model: input.lastUser.model,
+            tools: input.lastUser.tools,
+            format: input.lastUser.format,
+            time: { created: Date.now() },
+          })
+          yield* sessions.updatePart({
+            id: PartID.ascending(),
+            messageID: msg.id,
+            sessionID: msg.sessionID,
+            type: "text",
+            synthetic: true,
+            text: [
+              "<system-reminder>",
+              "Your previous response wrote a tool call as plain text instead of invoking the tool.",
+              "Re-issue it through the real tool channel — emit a structured tool call, not text.",
+              "Do not paste the tool call as text again.",
+              "</system-reminder>",
+            ].join("\n"),
+          } satisfies MessageV2.TextPart)
+          return true
+        })
+
         // json_schema mode but the model never produced structured output (plain
         // text stop, empty, think-only, or any other non-tool terminal). Retry up
         // to lastUser.format.retryCount with a repair nudge; on exhaustion write a
@@ -2432,6 +2513,11 @@ NOTE: At any point in time through this workflow you should feel free to ask the
             if (classification.type === "failed") {
               yield* writeModelError({ assistant: lastAssistant, reason: classification.reason })
               yield* slog.info("exiting loop", { classification: classification.type, reason: classification.reason })
+              break
+            }
+            if (classification.type === "text-tool-call") {
+              if (yield* autoRetryTextToolCall({ lastUser, assistant: lastAssistant })) continue
+              yield* slog.info("exiting loop", { classification: classification.type })
               break
             }
             if (classification.type === "think-only" || classification.type === "invalid") {
@@ -2969,6 +3055,10 @@ NOTE: At any point in time through this workflow you should feel free to ask the
                 yield* writeModelError({ assistant: handle.message, reason: forkClassification.reason })
                 return "break" as const
               }
+              if (forkClassification.type === "text-tool-call") {
+                if (yield* autoRetryTextToolCall({ lastUser, assistant: handle.message })) return "continue" as const
+                return "break" as const
+              }
               if (forkClassification.type !== "continue" && !handle.message.error && format.type === "json_schema") {
                 if (yield* autoRetryStructuredOutput({ lastUser, assistant: handle.message }))
                   return "continue" as const
@@ -3178,6 +3268,10 @@ NOTE: At any point in time through this workflow you should feel free to ask the
             }
             if (classification.type === "failed") {
               yield* writeModelError({ assistant: handle.message, reason: classification.reason })
+              return "break" as const
+            }
+            if (classification.type === "text-tool-call") {
+              if (yield* autoRetryTextToolCall({ lastUser, assistant: handle.message })) return "continue" as const
               return "break" as const
             }
             if (classification.type !== "continue" && !handle.message.error && format.type === "json_schema") {
