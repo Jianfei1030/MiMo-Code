@@ -294,6 +294,17 @@ bun run build:dev -- --skip-install
 - `package.json` 依赖发生变化
 - 从上游拉取更新后依赖有变
 
+## bin/mimo ESM 兼容性修复
+
+上游 v0.1.2+ 将 `packages/opencode/package.json` 改为 `"type": "module"`，导致 Node.js 把 `bin/mimo` 当作 ESM 解析，但原文件使用 CJS 语法（`require()`），运行时报 `ReferenceError: require is not defined in ES module scope`。
+
+我们已将 `bin/mimo` 从 CJS 转为 ESM（`import` 语法）。**合并上游时如果此文件被覆盖，需重新转换。** 检查方法：
+
+```powershell
+Select-String -Path packages/opencode/bin/mimo -Pattern "require\("
+# 应有输出 = 仍为 CJS，需要修复；无输出 = 已是 ESM
+```
+
 ## Git 推送与 husky pre-push hook（已移除）
 
 **`.husky/pre-push` 已被我们删除。** 原因：上游 `packages/app/src/custom-elements.d.ts` 是 symlink，Windows checkout 后变成纯文本文件，`tsgo` 无法解析，导致 `bun turbo typecheck` 必定失败，每次推送都需要 `--no-verify`。**等待上游修复此问题后再恢复 pre-push hook。**
@@ -320,6 +331,7 @@ Remove-Item .husky/pre-push -Force
 | `packages/opencode/src/skill/index.ts` | **技能加载竞态修复**：`loadSkills`（约 220 行）去掉 `concurrency: "unbounded"` 改为串行，使 `discoverSkills` 的扫描顺序（compose → 外部 `.claude`/`.agents` → config dirs → `skills.paths`）决定同名技能覆盖优先级——`skills.paths`（用户配置目录）最后扫描、最后 `add`、稳定胜出。`add` 的 duplicate 警告降级为 `log.debug`（约 100 行）。上游若恢复并发加载，同名技能（如 `deep-search`）在 `~/.claude/skills`（C盘）与 `skills.paths`（G盘）间会不确定覆盖，`skills.paths` 不再稳定胜出。检查方法：`Get-Content packages/opencode/src/skill/index.ts \| Select-String -Pattern "concurrency"` 应**无输出**（`Effect.forEach` 默认串行，不传 concurrency） |
 | `packages/opencode/test/session/skill-override-e2e.test.ts` | **新增的端到端测试文件**，上游不存在。锁定上述修复：用 `SystemPrompt.skills(agent)` 驱动真实技能加载→系统提示词组装管线，断言 `<available_skills>` 中 `deep-search` 的 `<location>` 指向 `skills.paths` 路径而非 `.claude/skills`。上游合并若删除此文件需从本地恢复 |
 | `packages/opencode/test/skill/skill.test.ts` | 含新增单元测试 `skills.paths overrides same-named skill in ~/.claude/skills`（基线无此用例）。上游合并若覆盖该文件需从本地恢复该用例。检查方法：`Select-String -Path packages/opencode/test/skill/skill.test.ts -Pattern "skills.paths overrides"` 应有输出 |
+| `packages/opencode/bin/mimo` | **ESM 兼容性**：上游 `type: "module"` 导致 CJS `require()` 报错，已转为 ESM `import` 语法。合并后若被覆盖需重新转换 |
 | `packages/opencode/src/util/ssrf.ts` | **SSRF 白名单支持**：添加了 `MIMOCODE_SSRF_ALLOWED_HOSTS` 环境变量解析和 hostname 跳过逻辑。上游若覆盖此文件需重新添加。检查方法：`Select-String -Path packages/opencode/src/util/ssrf.ts -Pattern "ALLOWED_HOSTS"` |
 | `.husky/pre-push` | **必须保持删除状态**。上游 symlink 问题导致 typecheck 在 Windows 上必定失败，等待上游修复后再恢复 |
 | `jf/README.md` | 本文件是我们的目录，上游可能删除整个目录 |
