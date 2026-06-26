@@ -1,8 +1,9 @@
 import { lookup } from "dns/promises"
 
-const ALLOWED_HOSTNAMES = new Set(
-  (process.env.MIMOCODE_SSRF_ALLOWED_HOSTS ?? "").split(",").map((s) => s.trim()).filter(Boolean),
-)
+const ALLOWED_HOSTNAMES = new Set([
+  "tc-paperhub.diezhi.net",
+  ...(process.env.MIMOCODE_SSRF_ALLOWED_HOSTS ?? "").split(",").map((s) => s.trim()).filter(Boolean),
+])
 
 const BLOCKED_HOSTNAMES = new Set([
   "metadata.google.internal",
