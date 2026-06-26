@@ -259,13 +259,17 @@ git merge upstream/main --allow-unrelated-histories --no-commit
 
 ## SSRF 白名单（内网 Provider）
 
-上游 v0.1.2 新增了 SSRF 保护（`src/util/ssrf.ts`），会阻止解析到内网 IP（`10.x`、`172.16-31.x`、`192.168.x` 等）的请求。如果 Provider API 地址解析到内网 IP（如 Paper Hub `tc-paperhub.diezhi.net` → `10.10.224.42`），需要设置环境变量：
+上游 v0.1.2 新增了 SSRF 保护（`src/util/ssrf.ts`），会阻止解析到内网 IP（`10.x`、`172.16-31.x`、`192.168.x` 等）的请求。Paper Hub（`tc-paperhub.diezhi.net` → `10.10.224.42`）已被我们**硬编码**到 `ssrf.ts` 的 `ALLOWED_HOSTNAMES` 中，无需设置环境变量即可正常工作。
+
+如需添加其他内网 hostname，可通过环境变量追加（多个用逗号分隔）：
 
 ```powershell
-[Environment]::SetEnvironmentVariable("MIMOCODE_SSRF_ALLOWED_HOSTS", "tc-paperhub.diezhi.net", "User")
+$env:MIMOCODE_SSRF_ALLOWED_HOSTS = "other-internal-host.example.com"
 ```
 
-多个 hostname 用逗号分隔。我们在 `ssrf.ts` 中添加了 `MIMOCODE_SSRF_ALLOWED_HOSTS` 支持，合并上游时此修改可能被覆盖，需重新添加。
+> **⚠️ VSCode 终端注意**：VSCode 终端不会可靠地加载 User 级环境变量（即使重启 VSCode）。这就是我们将 Paper Hub 硬编码而非仅依赖环境变量的原因。如果必须用环境变量方式，在 VSCode `settings.json` 中添加 `"terminal.integrated.env.windows": { "MIMOCODE_SSRF_ALLOWED_HOSTS": "..." }`。
+
+合并上游时 `ssrf.ts` 可能被覆盖，需重新添加 `ALLOWED_HOSTNAMES` 及硬编码条目。检查方法：`Select-String -Path packages/opencode/src/util/ssrf.ts -Pattern "ALLOWED_HOSTNAMES"`
 
 ## 注意事项
 
@@ -332,7 +336,7 @@ Remove-Item .husky/pre-push -Force
 | `packages/opencode/test/session/skill-override-e2e.test.ts` | **新增的端到端测试文件**，上游不存在。锁定上述修复：用 `SystemPrompt.skills(agent)` 驱动真实技能加载→系统提示词组装管线，断言 `<available_skills>` 中 `deep-search` 的 `<location>` 指向 `skills.paths` 路径而非 `.claude/skills`。上游合并若删除此文件需从本地恢复 |
 | `packages/opencode/test/skill/skill.test.ts` | 含新增单元测试 `skills.paths overrides same-named skill in ~/.claude/skills`（基线无此用例）。上游合并若覆盖该文件需从本地恢复该用例。检查方法：`Select-String -Path packages/opencode/test/skill/skill.test.ts -Pattern "skills.paths overrides"` 应有输出 |
 | `packages/opencode/bin/mimo` | **ESM 兼容性**：上游 `type: "module"` 导致 CJS `require()` 报错，已转为 ESM `import` 语法。合并后若被覆盖需重新转换 |
-| `packages/opencode/src/util/ssrf.ts` | **SSRF 白名单支持**：添加了 `MIMOCODE_SSRF_ALLOWED_HOSTS` 环境变量解析和 hostname 跳过逻辑。上游若覆盖此文件需重新添加。检查方法：`Select-String -Path packages/opencode/src/util/ssrf.ts -Pattern "ALLOWED_HOSTS"` |
+| `packages/opencode/src/util/ssrf.ts` | **SSRF 白名单**：`ALLOWED_HOSTNAMES` 硬编码了 `tc-paperhub.diezhi.net`，并支持 `MIMOCODE_SSRF_ALLOWED_HOSTS` 环境变量追加。上游若覆盖需重新添加。检查方法：`Select-String -Path packages/opencode/src/util/ssrf.ts -Pattern "ALLOWED_HOSTNAMES"` |
 | `.husky/pre-push` | **必须保持删除状态**。上游 symlink 问题导致 typecheck 在 Windows 上必定失败，等待上游修复后再恢复 |
 | `jf/README.md` | 本文件是我们的目录，上游可能删除整个目录 |
 
